@@ -657,7 +657,11 @@ func (t *Tensor) ScaledDotProductAttention(ctx ml.Context, key, value, mask ml.T
 		kqMask = mask.(*Tensor).t
 	}
 
-	kq := key.MulmatFullPrec(ctx, t)
+	query := t.Permute(ctx, 0, 2, 1, 3)
+	key = key.Permute(ctx, 0, 2, 1, 3)
+	value = value.Permute(ctx, 1, 2, 0, 3).Contiguous(ctx)
+
+	kq := key.MulmatFullPrec(ctx, query)
 	kq = &Tensor{
 		t: C.ggml_soft_max_ext(ctx.(*Context).ctx, kq.(*Tensor).t, kqMask, C.float(scale), 0),
 	}

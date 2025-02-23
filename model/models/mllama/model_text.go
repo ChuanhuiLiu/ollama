@@ -34,10 +34,6 @@ func (sa *TextSelfAttention) Forward(ctx ml.Context, hiddenState, positions, _ m
 	cache.Put(ctx, key, value)
 	key, value, mask := cache.Get(ctx)
 
-	query = query.Permute(ctx, 0, 2, 1, 3).Contiguous(ctx)
-	key = key.Permute(ctx, 0, 2, 1, 3).Contiguous(ctx)
-	value = value.Permute(ctx, 1, 2, 0, 3).Contiguous(ctx)
-
 	scaleFactor := 1.0 / math.Sqrt(float64(headDim))
 	attention := nn.Attention(ctx, query, key, value, mask, scaleFactor)
 	attention = attention.Reshape(ctx, opts.hiddenSize, batchSize)
@@ -122,10 +118,6 @@ func (ca *TextCrossAttention) Forward(ctx ml.Context, hiddenState, crossAttentio
 	} else {
 		key, value, mask = cache.Get(ctx)
 	}
-
-	query = query.Permute(ctx, 0, 2, 1, 3).Contiguous(ctx)
-	key = key.Permute(ctx, 0, 2, 1, 3).Contiguous(ctx)
-	value = value.Permute(ctx, 1, 2, 0, 3).Contiguous(ctx)
 
 	scaleFactor := 1.0 / math.Sqrt(float64(headDim))
 	attention := nn.Attention(ctx, query, key, value, mask, scaleFactor)
