@@ -458,11 +458,8 @@ func (s ServerStatus) ToString() string {
 }
 
 type ServerStatusResp struct {
-	Status          string  `json:"status"`
-	SlotsIdle       int     `json:"slots_idle"`
-	SlotsProcessing int     `json:"slots_processing"`
-	Error           string  `json:"error"`
-	Progress        float32 `json:"progress"`
+	Status   string  `json:"status"`
+	Progress float32 `json:"progress"`
 }
 
 func (s *llmServer) getServerStatus(ctx context.Context) (ServerStatus, error) {
@@ -505,11 +502,11 @@ func (s *llmServer) getServerStatus(ctx context.Context) (ServerStatus, error) {
 	}
 
 	switch status.Status {
-	case "ok":
+	case ServerStatusReady.ToString():
 		return ServerStatusReady, nil
-	case "no slot available":
+	case ServerStatusNoSlotsAvailable.ToString():
 		return ServerStatusNoSlotsAvailable, nil
-	case "loading model":
+	case ServerStatusLoadingModel.ToString():
 		s.loadProgress = status.Progress
 		return ServerStatusLoadingModel, nil
 	default:
@@ -643,63 +640,26 @@ type ImageData struct {
 	AspectRatioID int    `json:"aspect_ratio_id"`
 }
 
-type completion struct {
-	Content      string `json:"content"`
-	Model        string `json:"model"`
-	Prompt       string `json:"prompt"`
-	Stop         bool   `json:"stop"`
-	StoppedLimit bool   `json:"stopped_limit"`
-
-	Timings struct {
-		PredictedN  int     `json:"predicted_n"`
-		PredictedMS float64 `json:"predicted_ms"`
-		PromptN     int     `json:"prompt_n"`
-		PromptMS    float64 `json:"prompt_ms"`
-	}
-}
-
 type CompletionRequest struct {
 	Prompt  string
 	Format  json.RawMessage
 	Images  []ImageData
 	Options *api.Options
+
+	Grammar string // set before sending the request to the subprocess
 }
 
 type CompletionResponse struct {
-	Content            string
-	DoneReason         string
-	Done               bool
-	PromptEvalCount    int
-	PromptEvalDuration time.Duration
-	EvalCount          int
-	EvalDuration       time.Duration
+	Content            string        `json:"content"`
+	DoneReason         string        `json:"done_reason"`
+	Done               bool          `json:"done"`
+	PromptEvalCount    int           `json:"prompt_eval_count"`
+	PromptEvalDuration time.Duration `json:"prompt_eval_duration"`
+	EvalCount          int           `json:"eval_count"`
+	EvalDuration       time.Duration `json:"eval_duration"`
 }
 
 func (s *llmServer) Completion(ctx context.Context, req CompletionRequest, fn func(CompletionResponse)) error {
-	request := map[string]any{
-		"prompt":            req.Prompt,
-		"stream":            true,
-		"n_predict":         req.Options.NumPredict,
-		"n_keep":            req.Options.NumKeep,
-		"main_gpu":          req.Options.MainGPU,
-		"temperature":       req.Options.Temperature,
-		"top_k":             req.Options.TopK,
-		"top_p":             req.Options.TopP,
-		"min_p":             req.Options.MinP,
-		"typical_p":         req.Options.TypicalP,
-		"repeat_last_n":     req.Options.RepeatLastN,
-		"repeat_penalty":    req.Options.RepeatPenalty,
-		"presence_penalty":  req.Options.PresencePenalty,
-		"frequency_penalty": req.Options.FrequencyPenalty,
-		"mirostat":          req.Options.Mirostat,
-		"mirostat_tau":      req.Options.MirostatTau,
-		"mirostat_eta":      req.Options.MirostatEta,
-		"seed":              req.Options.Seed,
-		"stop":              req.Options.Stop,
-		"image_data":        req.Images,
-		"cache_prompt":      true,
-	}
-
 	if len(req.Format) > 0 {
 		switch string(req.Format) {
 		case `null`, `""`:
@@ -707,7 +667,7 @@ func (s *llmServer) Completion(ctx context.Context, req CompletionRequest, fn fu
 			// these as "not set".
 			break
 		case `"json"`:
-			request["grammar"] = grammarJSON
+			req.Grammar = grammarJSON
 		default:
 			if req.Format[0] != '{' {
 				return fmt.Errorf("invalid format: %q; expected \"json\" or a valid JSON Schema object", req.Format)
@@ -718,8 +678,13 @@ func (s *llmServer) Completion(ctx context.Context, req CompletionRequest, fn fu
 			if g == nil {
 				return fmt.Errorf("invalid JSON schema in format")
 			}
-			request["grammar"] = string(g)
+			req.Grammar = string(g)
 		}
+	}
+
+	if req.Options == nil {
+		opts := api.DefaultOptions()
+		req.Options = &opts
 	}
 
 	if err := s.sem.Acquire(ctx, 1); err != nil {
@@ -750,7 +715,7 @@ func (s *llmServer) Completion(ctx context.Context, req CompletionRequest, fn fu
 	enc := json.NewEncoder(buffer)
 	enc.SetEscapeHTML(false)
 
-	if err := enc.Encode(request); err != nil {
+	if err := enc.Encode(req); err != nil {
 		return fmt.Errorf("failed to marshal data: %v", err)
 	}
 
@@ -801,7 +766,7 @@ func (s *llmServer) Completion(ctx context.Context, req CompletionRequest, fn fu
 				evt = line
 			}
 
-			var c completion
+			var c CompletionResponse
 			if err := json.Unmarshal(evt, &c); err != nil {
 				return fmt.Errorf("error unmarshalling llm prediction response: %v", err)
 			}
@@ -825,20 +790,8 @@ func (s *llmServer) Completion(ctx context.Context, req CompletionRequest, fn fu
 				})
 			}
 
-			if c.Stop {
-				doneReason := "stop"
-				if c.StoppedLimit {
-					doneReason = "length"
-				}
-
-				fn(CompletionResponse{
-					Done:               true,
-					DoneReason:         doneReason,
-					PromptEvalCount:    c.Timings.PromptN,
-					PromptEvalDuration: parseDurationMs(c.Timings.PromptMS),
-					EvalCount:          c.Timings.PredictedN,
-					EvalDuration:       parseDurationMs(c.Timings.PredictedMS),
-				})
+			if c.Done {
+				fn(c)
 				return nil
 			}
 		}
@@ -1111,13 +1064,4 @@ func (s *llmServer) EstimatedVRAMByGPU(gpuID string) uint64 {
 		}
 	}
 	return 0
-}
-
-func parseDurationMs(ms float64) time.Duration {
-	dur, err := time.ParseDuration(fmt.Sprintf("%fms", ms))
-	if err != nil {
-		panic(err)
-	}
-
-	return dur
 }
